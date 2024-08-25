@@ -14,6 +14,15 @@
 
 #define STREAM_FD STDIN_FILENO
 
+typedef enum _Action {
+    Action__MoveCursorUp,
+    Action__MoveCursorDown,
+    Action__MoveCursorLeft,
+    Action__MoveCursorRight,
+    Action__MovePageUp,
+    Action__MovePageDown,
+} Action;
+
 typedef struct _Property {
     struct _Property__Window {
         size_t num_rows;
@@ -25,6 +34,40 @@ typedef struct _Property {
     } cursor;
 } Property;
 
+void Property__perform_action(Property * property, Action action) {
+    typeof(property->window) * window = &property->window;
+    typeof(property->cursor) * cursor = &property->cursor;
+
+    switch (action) {
+    case Action__MoveCursorUp:
+        if (cursor->pos_y > 0) {
+            cursor->pos_y -= 1;
+        }
+        break;
+
+    case Action__MoveCursorDown:
+        if (cursor->pos_y < window->num_columns - 1) {
+            cursor->pos_y += 1;
+        }
+        break;
+
+    case Action__MoveCursorLeft:
+        if (cursor->pos_x > 0) {
+            cursor->pos_x -= 1;
+        }
+        break;
+
+    case Action__MoveCursorRight:
+        if (cursor->pos_x < window->num_rows - 1) {
+            cursor->pos_x += 1;
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
 static Property property = {
     .window = {
         .num_rows = 0,
@@ -35,13 +78,6 @@ static Property property = {
         .pos_y = 0,
     },
 };
-
-void update_window_size(void) {
-    struct winsize attr;
-    ioctl(STREAM_FD, TIOCGWINSZ, &attr);
-    property.window.num_rows = attr.ws_row;
-    property.window.num_columns = attr.ws_col;
-}
 
 static struct termios term__attr_backup;
 
@@ -256,6 +292,177 @@ void cmd__refresh_screen(void) {
     CmdWriter__free(&writer);
 }
 
+
+
+typedef enum _State {
+    State__Start,
+
+    /* Got '\x1B'. */
+    State__GotEsc,
+
+    /* Got '\x1B', and '['. */
+    State__GotEscBkt,
+
+    /* Got '\x1B', '[', and digit characters. */
+    State__GotEscBktDgt,
+
+    /* Got '\x1B', '[', and alphabet. */
+    State__GotEscBktAlp,
+} State;
+
+typedef struct _Parser {
+    Property * property;
+    State state;
+    size_t arg_num;
+} Parser;
+
+void Parser__init(
+    Parser * parser,
+    Property * property
+) {
+    parser->property = property;
+    parser->state = State__Start,
+    parser->arg_num = 0;
+}
+
+typedef enum _Result {
+    Result__Continue,
+    Result__Again,
+} Result;
+
+Result Parser__run_fsm(Parser * parser, uint8_t byte) {
+    Property * property = parser->property;
+
+    Result result = Result__Continue;
+
+    switch (parser->state) {
+    case State__Start:
+        switch (byte) {
+        case '\x1B':
+            parser->state = State__GotEsc;
+            break;
+
+        case 'k':
+            Property__perform_action(property, Action__MoveCursorUp);
+            break;
+
+        case 'j':
+            Property__perform_action(property, Action__MoveCursorDown);
+            break;
+
+        case 'h':
+            Property__perform_action(property, Action__MoveCursorLeft);
+            break;
+
+        case 'l':
+            Property__perform_action(property, Action__MoveCursorRight);
+            break;
+
+        default:
+            break;
+        }
+
+        break;
+
+    case State__GotEsc:
+        if (byte == '[') {
+            parser->state = State__GotEscBkt;
+            break;
+        }
+
+        parser->state = State__Start;
+        result = Result__Again;
+        break;
+
+    case State__GotEscBkt:
+        if (byte >= '0' &&
+            byte <= '9') {
+            parser->arg_num = byte - '0';
+            parser->state = State__GotEscBktDgt;
+            break;
+        }
+
+        if (byte >= 'A' &&
+            byte <= 'Z') {
+            switch (byte) {
+            case 'A':
+                Property__perform_action(property, Action__MoveCursorUp);
+                break;
+
+            case 'B':
+                Property__perform_action(property, Action__MoveCursorDown);
+                break;
+
+            case 'C':
+                Property__perform_action(property, Action__MoveCursorRight);
+                break;
+
+            case 'D':
+                Property__perform_action(property, Action__MoveCursorLeft);
+                break;
+            }
+
+            parser->state = State__Start;
+            break;
+        }
+
+        parser->state = State__Start;
+        result = Result__Again;
+        break;
+
+    case State__GotEscBktDgt:
+        if (byte >= '0' &&
+            byte <= '9') {
+            parser->arg_num *= 10;
+            parser->arg_num += byte - '0';
+            break;
+        }
+
+        if (byte == '~') {
+            switch (parser->arg_num) {
+            case 5:
+                Property__perform_action(property, Action__MovePageUp);
+                break;
+
+            case 6:
+                Property__perform_action(property, Action__MovePageDown);
+                break;
+            }
+
+            parser->state = State__Start;
+            break;
+        }
+
+        parser->state = State__Start;
+        result = Result__Again;
+        break;
+
+    case State__GotEscBktAlp:
+        break;
+    }
+
+    return result;
+}
+
+void Parser__feed_byte(Parser * parser, uint8_t byte) {
+    Result result;
+
+    do {
+        result = Parser__run_fsm(parser, byte);
+    } while (result == Result__Again);
+}
+
+
+
+void Property__update_window_size(Property * property) {
+    struct winsize attr;
+    ioctl(STREAM_FD, TIOCGWINSZ, &attr);
+    property->window.num_rows = attr.ws_row;
+    property->window.num_columns = attr.ws_col;
+}
+
+
+
 int main(int argc, char ** argv) {
     term__backup();
 
@@ -263,7 +470,10 @@ int main(int argc, char ** argv) {
 
     term__enable_raw_mode();
 
-    update_window_size();
+    Property__update_window_size(&property);
+
+    Parser parser;
+    Parser__init(&parser, &property);
 
     while (true) {
         uint8_t byte;
@@ -280,37 +490,7 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        typeof(property.window) * window = &property.window;
-        typeof(property.cursor) * cursor = &property.cursor;
-
-        switch (byte) {
-        case 'k':
-            if (cursor->pos_y > 0) {
-                cursor->pos_y -= 1;
-            }
-            break;
-
-        case 'j':
-            if (cursor->pos_y < window->num_columns - 1) {
-                cursor->pos_y += 1;
-            }
-            break;
-
-        case 'h':
-            if (cursor->pos_x > 0) {
-                cursor->pos_x -= 1;
-            }
-            break;
-
-        case 'l':
-            if (cursor->pos_x < window->num_rows - 1) {
-                cursor->pos_x += 1;
-            }
-            break;
-
-        default:
-            break;
-        }
+        Parser__feed_byte(&parser, byte);
 
         cmd__refresh_screen();
 
